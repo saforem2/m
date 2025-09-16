@@ -1,0 +1,56 @@
+Screen {
+    layout: grid;
+    grid-rows: auto 1fr auto auto;
+    grid-columns: 1fr;
+}
+
+Header {
+    grid-row: 1;
+}
+
+#body {
+    grid-row: 2;
+    padding: 0 1;
+}
+
+#main {
+    layout: horizontal;
+    height: 100%;
+    gap: 1;
+}
+
+#left_panel {
+    layout: vertical;
+    width: 3fr;
+    gap: 1;
+}
+
+#summary {
+    border: round $surface;
+    padding: 0 1;
+}
+
+TabbedContent {
+    height: 1fr;
+    border: tall $surface;
+}
+
+DataTable {
+    height: 1fr;
+}
+
+#details {
+    width: 2fr;
+    border: tall $surface;
+    padding: 1 2;
+}
+
+#status {
+    grid-row: 3;
+    padding: 0 1;
+    background: $surface-darken-1;
+}
+
+Footer {
+    grid-row: 4;
+}
