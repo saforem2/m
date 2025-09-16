@@ -7,13 +7,15 @@ import logging
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 from xml.etree import ElementTree as ET
 
 from .data import Job, Node, Queue, SchedulerSnapshot
 from .samples import sample_snapshot
 
 _LOGGER = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 def _parse_bool(value: Optional[str]) -> Optional[bool]:
@@ -108,8 +110,11 @@ class PBSDataFetcher:
         self.command_timeout = command_timeout
         self.fallback_to_sample = fallback_to_sample
         self._qstat_jobs_cmd = [self.qstat_path, "-f", "-x"]
+        self._qstat_jobs_text_cmd = [self.qstat_path, "-f"]
         self._qstat_queue_cmd = [self.qstat_path, "-Q", "-f", "-x"]
+        self._qstat_queue_text_cmd = [self.qstat_path, "-Q", "-f"]
         self._pbsnodes_cmd = [self.pbsnodes_path, "-x"]
+        self._pbsnodes_text_cmd = [self.pbsnodes_path, "-a"]
 
     async def fetch_snapshot(self) -> SchedulerSnapshot:
         """Collect scheduler information.
@@ -156,40 +161,59 @@ class PBSDataFetcher:
         return snapshot
 
     async def _fetch_jobs(self) -> Tuple[List[Job], List[str]]:
-        output, error = await self._run_command(self._qstat_jobs_cmd)
-        if output is None:
-            return [], [error or "Unable to execute qstat"]
-        try:
-            jobs = self._parse_jobs_xml(output)
-            return jobs, []
-        except ET.ParseError as exc:
-            message = f"Failed to parse qstat XML output: {exc}"
-            _LOGGER.warning(message)
-            return [], [message]
+        attempts: Sequence[Tuple[List[str], Callable[[str], List[Job]], str]] = (
+            (self._qstat_jobs_cmd, self._parse_jobs_xml, "qstat XML output"),
+            (self._qstat_jobs_text_cmd, self._parse_jobs_text, "qstat full output"),
+        )
+        return await self._attempt_fetch(
+            attempts, "Unable to obtain job information from qstat"
+        )
 
     async def _fetch_nodes(self) -> Tuple[List[Node], List[str]]:
-        output, error = await self._run_command(self._pbsnodes_cmd)
-        if output is None:
-            return [], [error or "Unable to execute pbsnodes"]
-        try:
-            nodes = self._parse_nodes_xml(output)
-            return nodes, []
-        except ET.ParseError as exc:
-            message = f"Failed to parse pbsnodes XML output: {exc}"
-            _LOGGER.warning(message)
-            return [], [message]
+        attempts: Sequence[Tuple[List[str], Callable[[str], List[Node]], str]] = (
+            (self._pbsnodes_cmd, self._parse_nodes_xml, "pbsnodes XML output"),
+            (self._pbsnodes_text_cmd, self._parse_nodes_text, "pbsnodes full output"),
+        )
+        return await self._attempt_fetch(
+            attempts, "Unable to obtain node information from pbsnodes"
+        )
 
     async def _fetch_queues(self) -> Tuple[List[Queue], List[str]]:
-        output, error = await self._run_command(self._qstat_queue_cmd)
-        if output is None:
-            return [], [error or "Unable to execute qstat for queues"]
-        try:
-            queues = self._parse_queues_xml(output)
-            return queues, []
-        except ET.ParseError as exc:
-            message = f"Failed to parse queue XML output: {exc}"
-            _LOGGER.warning(message)
-            return [], [message]
+        attempts: Sequence[Tuple[List[str], Callable[[str], List[Queue]], str]] = (
+            (self._qstat_queue_cmd, self._parse_queues_xml, "queue XML output"),
+            (self._qstat_queue_text_cmd, self._parse_queues_text, "queue full output"),
+        )
+        return await self._attempt_fetch(
+            attempts, "Unable to obtain queue information from qstat"
+        )
+
+    async def _attempt_fetch(
+        self,
+        attempts: Sequence[Tuple[List[str], Callable[[str], List[T]], str]],
+        base_error: str,
+    ) -> Tuple[List[T], List[str]]:
+        errors: List[str] = []
+        for command, parser, description in attempts:
+            output, error = await self._run_command(command)
+            if output is None:
+                if error:
+                    errors.append(error)
+                else:
+                    errors.append(f"Unable to execute {' '.join(command)}")
+                continue
+            try:
+                return parser(output), []
+            except asyncio.CancelledError:
+                raise
+            except ET.ParseError as exc:
+                message = f"Failed to parse {description}: {exc}"
+                _LOGGER.warning(message)
+                errors.append(message)
+            except Exception as exc:  # pragma: no cover - defensive
+                message = f"Failed to parse {description}: {exc}"
+                _LOGGER.warning(message)
+                errors.append(message)
+        return [], errors or [base_error]
 
     async def _run_command(self, cmd: List[str]) -> Tuple[Optional[str], Optional[str]]:
         """Execute *cmd* asynchronously and return ``(stdout, error)``."""
@@ -299,6 +323,247 @@ class PBSDataFetcher:
             )
             queues.append(queue)
         return queues
+
+    def _parse_jobs_text(self, text: str) -> List[Job]:
+        records: List[Dict[str, str]] = []
+        record: Dict[str, str] = {}
+        last_key: Optional[str] = None
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                if record:
+                    records.append(record)
+                    record = {}
+                last_key = None
+                continue
+            stripped = line.strip()
+            key: str
+            value: str
+            if stripped.lower().startswith("job id"):
+                if record:
+                    records.append(record)
+                    record = {}
+                key, value = self._split_key_value(stripped)
+                record["Job_Id"] = value
+                last_key = "Job_Id"
+                continue
+            key, value = self._split_key_value(stripped)
+            if key:
+                record[key] = value
+                last_key = key
+            elif last_key:
+                combined = f"{record.get(last_key, '')} {stripped}".strip()
+                record[last_key] = combined
+        if record:
+            records.append(record)
+
+        jobs: List[Job] = []
+        for mapping in records:
+            job = self._job_from_mapping(mapping)
+            if job is not None:
+                jobs.append(job)
+        return jobs
+
+    def _job_from_mapping(self, mapping: Dict[str, str]) -> Optional[Job]:
+        job_id = (
+            mapping.get("Job_Id")
+            or mapping.get("Job Id")
+            or mapping.get("JobID")
+            or mapping.get("JobId")
+        )
+        if not job_id:
+            return None
+
+        resources_requested = {
+            key.split(".", 1)[1]: value.strip()
+            for key, value in mapping.items()
+            if key.startswith("Resource_List.") and "." in key
+        }
+        resources_used = {
+            key.split(".", 1)[1]: value.strip()
+            for key, value in mapping.items()
+            if key.startswith("resources_used.") and "." in key
+        }
+
+        comment = (mapping.get("comment") or mapping.get("sched_comment") or "").strip()
+        if not comment:
+            comment = None
+
+        exit_status = (mapping.get("Exit_status") or mapping.get("exit_status") or "").strip()
+        if not exit_status:
+            exit_status = None
+
+        job = Job(
+            id=job_id.strip(),
+            name=(mapping.get("Job_Name") or mapping.get("Job Name") or "").strip(),
+            user=self._normalise_user(
+                mapping.get("Job_Owner") or mapping.get("owner") or mapping.get("User_List")
+            ),
+            queue=(mapping.get("queue") or mapping.get("Queue") or "").strip(),
+            state=(mapping.get("job_state") or mapping.get("jobstate") or "").strip(),
+            exec_host=(mapping.get("exec_host") or mapping.get("exec_host2") or "").strip() or None,
+            create_time=_parse_timestamp(mapping.get("ctime")),
+            start_time=_parse_timestamp(
+                mapping.get("start_time")
+                or mapping.get("stime")
+                or mapping.get("etime")
+                or mapping.get("qtime")
+            ),
+            end_time=_parse_timestamp(mapping.get("comp_time") or mapping.get("mtime")),
+            walltime=resources_requested.get("walltime")
+            or mapping.get("walltime")
+            or mapping.get("resources_default.walltime"),
+            nodes=resources_requested.get("nodes") or mapping.get("nodes"),
+            resources_requested=resources_requested,
+            resources_used=resources_used,
+            comment=comment,
+            exit_status=exit_status,
+        )
+        return job
+
+    def _parse_nodes_text(self, text: str) -> List[Node]:
+        nodes: List[Node] = []
+        mapping: Dict[str, str] = {}
+        current_name: Optional[str] = None
+        last_key: Optional[str] = None
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                if current_name:
+                    node = self._node_from_mapping(current_name, mapping)
+                    if node is not None:
+                        nodes.append(node)
+                mapping = {}
+                current_name = None
+                last_key = None
+                continue
+            if not raw_line.startswith((" ", "\t")) and "=" not in line and ":" not in line:
+                if current_name:
+                    node = self._node_from_mapping(current_name, mapping)
+                    if node is not None:
+                        nodes.append(node)
+                current_name = line.strip()
+                mapping = {}
+                last_key = None
+                continue
+            stripped = line.strip()
+            key, value = self._split_key_value(stripped)
+            if key:
+                mapping[key] = value
+                last_key = key
+            elif last_key:
+                combined = f"{mapping.get(last_key, '')} {stripped}".strip()
+                mapping[last_key] = combined
+        if current_name:
+            node = self._node_from_mapping(current_name, mapping)
+            if node is not None:
+                nodes.append(node)
+        return nodes
+
+    def _node_from_mapping(self, name: str, mapping: Dict[str, str]) -> Optional[Node]:
+        name = name.strip()
+        if not name:
+            return None
+        resources_available = {
+            key.split(".", 1)[1]: value.strip()
+            for key, value in mapping.items()
+            if key.startswith("resources_available.") and "." in key
+        }
+        resources_assigned = {
+            key.split(".", 1)[1]: value.strip()
+            for key, value in mapping.items()
+            if key.startswith("resources_assigned.") and "." in key
+        }
+        comment = (mapping.get("comment") or mapping.get("note") or "").strip()
+        if not comment:
+            comment = None
+        node = Node(
+            name=name,
+            state=(mapping.get("state") or mapping.get("states") or "").strip(),
+            np=_parse_int(mapping.get("np")),
+            ncpus=_parse_int(
+                resources_available.get("ncpus")
+                or mapping.get("ncpus")
+                or resources_available.get("np")
+            ),
+            properties=self._parse_properties(mapping.get("properties")),
+            jobs=self._parse_node_jobs(mapping.get("jobs", "")),
+            resources_available=resources_available,
+            resources_assigned=resources_assigned,
+            comment=comment,
+        )
+        return node
+
+    def _parse_queues_text(self, text: str) -> List[Queue]:
+        queues: List[Queue] = []
+        mapping: Dict[str, str] = {}
+        current_name: Optional[str] = None
+        last_key: Optional[str] = None
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                if current_name:
+                    queue = self._queue_from_mapping(current_name, mapping)
+                    queues.append(queue)
+                mapping = {}
+                current_name = None
+                last_key = None
+                continue
+            stripped = line.strip()
+            lower = stripped.lower()
+            if lower.startswith("queue:") or lower.startswith("queue ="):
+                if current_name:
+                    queue = self._queue_from_mapping(current_name, mapping)
+                    queues.append(queue)
+                _, value = self._split_key_value(stripped)
+                current_name = value
+                mapping = {}
+                last_key = None
+                continue
+            key, value = self._split_key_value(stripped)
+            if key:
+                mapping[key] = value
+                last_key = key
+            elif last_key:
+                combined = f"{mapping.get(last_key, '')} {stripped}".strip()
+                mapping[last_key] = combined
+        if current_name:
+            queue = self._queue_from_mapping(current_name, mapping)
+            queues.append(queue)
+        return queues
+
+    def _queue_from_mapping(self, name: str, mapping: Dict[str, str]) -> Queue:
+        resources_default = {
+            key.split(".", 1)[1]: value.strip()
+            for key, value in mapping.items()
+            if key.startswith("resources_default.") and "." in key
+        }
+        resources_max = {
+            key.split(".", 1)[1]: value.strip()
+            for key, value in mapping.items()
+            if key.startswith("resources_max.") and "." in key
+        }
+        comment = (mapping.get("comment") or "").strip() or None
+        queue = Queue(
+            name=name.strip(),
+            state=(mapping.get("state_count") or mapping.get("state") or "").strip() or None,
+            enabled=_parse_bool(mapping.get("enabled")),
+            started=_parse_bool(mapping.get("started")),
+            total_jobs=_parse_int(mapping.get("total_jobs")),
+            job_states=self._parse_state_counts(mapping.get("state_count")),
+            resources_default=resources_default,
+            resources_max=resources_max,
+            comment=comment,
+        )
+        return queue
+
+    @staticmethod
+    def _split_key_value(line: str) -> Tuple[str, str]:
+        for separator in ("=", ":"):
+            if separator in line:
+                key, value = line.split(separator, 1)
+                return key.strip(), value.strip()
+        return "", line.strip()
 
     def _populate_queue_job_counts(self, snapshot: SchedulerSnapshot) -> None:
         if not snapshot.queues and not snapshot.jobs:
