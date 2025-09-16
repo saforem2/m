@@ -59,6 +59,13 @@ If you want to explore the UI without a live PBS cluster, export `PBS_TUI_SAMPLE
 (or pass `force_sample=True` to `PBSDataFetcher`). The application will display bundled example
 jobs, nodes, and queues along with a warning banner indicating that the data is synthetic.
 
+### Headless / automated runs
+
+For automated testing or CI environments without an interactive terminal you can run the TUI in
+headless mode by exporting `PBS_TUI_HEADLESS=1`. Pairing this with `PBS_TUI_AUTOPILOT=quit`
+presses the `q` binding automatically after startup so `pbs-tui` exits cleanly once the interface
+has rendered its first update.
+
 ## Architecture
 
 - `pbs_tui.fetcher.PBSDataFetcher` orchestrates `qstat`/`pbsnodes` calls, parses XML output, and

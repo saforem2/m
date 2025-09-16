@@ -14,18 +14,19 @@ Header {
 #main {
     layout: horizontal;
     height: 100%;
-    gap: 1;
+    padding-right: 1;
 }
 
 #left_panel {
     layout: vertical;
     width: 3fr;
-    gap: 1;
+    padding-right: 1;
 }
 
 #summary {
     border: round $surface;
     padding: 0 1;
+    margin-bottom: 1;
 }
 
 TabbedContent {
@@ -41,6 +42,7 @@ DataTable {
     width: 2fr;
     border: tall $surface;
     padding: 1 2;
+    margin-left: 1;
 }
 
 #status {

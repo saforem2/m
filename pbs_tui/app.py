@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
@@ -12,6 +13,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Static, TabPane, TabbedContent
+from textual.pilot import Pilot
 
 from .data import Job, Node, Queue, SchedulerSnapshot
 from .fetcher import PBSDataFetcher
@@ -438,11 +440,32 @@ class PBSTUI(App[None]):
                 self.query_one(DetailPanel).show_queue(queue)
 
 
+def _env_flag(name: str) -> bool:
+    """Return ``True`` when *name* is set to a truthy value."""
+
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no"}
+
+
 def run() -> None:
     """Entry point used by the ``pbs-tui`` console script."""
 
+    headless = _env_flag("PBS_TUI_HEADLESS")
+    auto_pilot = None
+    auto_flag = os.getenv("PBS_TUI_AUTOPILOT", "").strip().lower()
+
+    if auto_flag in {"quit", "exit"}:
+
+        async def _auto_quit(pilot: Pilot) -> None:
+            await pilot.pause(0.1)
+            await pilot.press("q")
+
+        auto_pilot = _auto_quit
+
     app = PBSTUI()
-    app.run()
+    app.run(headless=headless, auto_pilot=auto_pilot)
 
 
 __all__ = ["PBSTUI", "run"]
