@@ -5,11 +5,11 @@ Screen {
 }
 
 Header {
-    grid-row: 1;
+    row: 1;
 }
 
 #body {
-    grid-row: 2;
+    row: 2;
     padding: 0 1;
 }
 
@@ -46,11 +46,11 @@ DataTable {
 }
 
 #status {
-    grid-row: 3;
+    row: 3;
     padding: 0 1;
     background: $surface-darken-1;
 }
 
 Footer {
-    grid-row: 4;
+    row: 4;
 }
