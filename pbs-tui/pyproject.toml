@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Textual TUI dashboard for monitoring PBS Pro schedulers"
 readme = "README.md"
 authors = [{name = "Argonne Leadership Computing Facility"}]
-license = {file = "LICENSE"}
+license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     "textual>=0.48.0",

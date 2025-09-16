@@ -7,9 +7,12 @@ import asyncio
 import os
 import sys
 from collections import Counter
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Iterable, Optional, Sequence
 
+from rich import box
+from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -459,6 +462,15 @@ def _markdown_cell(value: Optional[str]) -> str:
     return _escape_markdown_cell(text)
 
 
+def _table_cell(value: Optional[str]) -> str:
+    if value is None:
+        return "-"
+    text = str(value)
+    if not text.strip():
+        return "-"
+    return text
+
+
 def snapshot_to_markdown(snapshot: SchedulerSnapshot) -> str:
     """Return a Markdown table describing the jobs in *snapshot*."""
 
@@ -502,6 +514,58 @@ def snapshot_to_markdown(snapshot: SchedulerSnapshot) -> str:
     return "\n".join(lines)
 
 
+def snapshot_to_table(snapshot: SchedulerSnapshot) -> Table:
+    """Return a Rich table describing the jobs in *snapshot*."""
+
+    if snapshot.timestamp:
+        try:
+            timestamp = snapshot.timestamp.astimezone()
+        except ValueError:
+            timestamp = snapshot.timestamp
+    else:
+        timestamp = datetime.now()
+
+    table = Table(
+        title=f"PBS Jobs as of {timestamp.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        caption=f"Source: {snapshot.source}",
+        box=box.SIMPLE_HEAVY,
+        highlight=True,
+    )
+    headers = [
+        ("Job ID", "left"),
+        ("Name", "left"),
+        ("User", "left"),
+        ("Queue", "left"),
+        ("State", "left"),
+        ("Nodes", "left"),
+        ("Walltime", "left"),
+        ("Runtime", "left"),
+    ]
+    for header, justify in headers:
+        table.add_column(header, justify=justify)
+
+    reference_time = snapshot.timestamp or datetime.now()
+    if snapshot.jobs:
+        for job in _sort_jobs_for_display(snapshot.jobs):
+            table.add_row(
+                _table_cell(job.id),
+                _table_cell(job.name),
+                _table_cell(job.user),
+                _table_cell(job.queue),
+                _table_cell(JOB_STATE_LABELS.get(job.state, job.state)),
+                _table_cell(job.nodes or "-"),
+                _table_cell(job.walltime or "-"),
+                _table_cell(_format_duration(job.runtime(reference_time))),
+            )
+    else:
+        table.add_row(
+            "No jobs available",
+            *[""] * (len(headers) - 1),
+            style="italic",
+        )
+    return table
+
+
 def _env_flag(name: str) -> bool:
     """Return ``True`` when *name* is set to a truthy value."""
 
@@ -522,7 +586,13 @@ def run(
     parser.add_argument(
         "--inline",
         action="store_true",
-        help="Fetch PBS data once and print a Markdown table instead of starting the TUI.",
+        help="Fetch PBS data once and print a Rich table instead of starting the TUI.",
+    )
+    parser.add_argument(
+        "--file",
+        type=Path,
+        metavar="PATH",
+        help="With --inline, write a Markdown snapshot to PATH.",
     )
     parser.add_argument(
         "--refresh-interval",
@@ -535,9 +605,15 @@ def run(
 
     fetcher_instance = fetcher or PBSDataFetcher()
 
+    if args.file and not args.inline:
+        parser.error("--file can only be used together with --inline")
+
     if args.inline:
         snapshot = asyncio.run(fetcher_instance.fetch_snapshot())
-        print(snapshot_to_markdown(snapshot))
+        console = Console()
+        console.print(snapshot_to_table(snapshot))
+        if args.file:
+            args.file.write_text(snapshot_to_markdown(snapshot) + "\n")
         if snapshot.errors:
             for message in snapshot.errors:
                 print(message, file=sys.stderr)
