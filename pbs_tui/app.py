@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import os
+import sys
 from collections import Counter
 from datetime import datetime, timedelta
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Static, TabPane, TabbedContent
 from textual.pilot import Pilot
 
@@ -29,6 +32,17 @@ JOB_STATE_LABELS = {
     "T": "Transit",
     "W": "Waiting",
 }
+
+
+def _sort_jobs_for_display(jobs: Iterable[Job]) -> list[Job]:
+    return sorted(
+        jobs,
+        key=lambda job: (
+            0 if job.state == "R" else 1,
+            job.queue or "",
+            job.id,
+        ),
+    )
 
 
 def _format_bool(value: Optional[bool]) -> str:
@@ -228,15 +242,7 @@ class JobsTable(DataTable):
 
     def update_jobs(self, jobs: Iterable[Job], reference_time: datetime) -> None:
         self.clear()
-        sorted_jobs = sorted(
-            jobs,
-            key=lambda job: (
-                0 if job.state == "R" else 1,
-                job.queue or "",
-                job.id,
-            ),
-        )
-        for job in sorted_jobs:
+        for job in _sort_jobs_for_display(jobs):
             runtime = _format_duration(job.runtime(reference_time))
             self.add_row(
                 job.id,
@@ -332,18 +338,17 @@ class PBSTUI(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Container(id="body"):
-            with Horizontal(id="main"):
-                with Vertical(id="left_panel"):
-                    yield SummaryWidget(id="summary")
-                    with TabbedContent(id="tabs"):
-                        with TabPane("Jobs", id="jobs_tab"):
-                            yield JobsTable(id="jobs_table")
-                        with TabPane("Nodes", id="nodes_tab"):
-                            yield NodesTable(id="nodes_table")
-                        with TabPane("Queues", id="queues_tab"):
-                            yield QueuesTable(id="queues_table")
-                yield DetailPanel(id="details")
+        with Horizontal(id="main"):
+            with Vertical(id="left_panel"):
+                yield SummaryWidget(id="summary")
+                with TabbedContent(id="tabs"):
+                    with TabPane("Jobs", id="jobs_tab"):
+                        yield JobsTable(id="jobs_table")
+                    with TabPane("Nodes", id="nodes_tab"):
+                        yield NodesTable(id="nodes_table")
+                    with TabPane("Queues", id="queues_tab"):
+                        yield QueuesTable(id="queues_table")
+            yield DetailPanel(id="details")
         yield StatusBar(id="status")
         yield Footer()
 
@@ -440,6 +445,63 @@ class PBSTUI(App[None]):
                 self.query_one(DetailPanel).show_queue(queue)
 
 
+def _escape_markdown_cell(text: str) -> str:
+    cleaned = text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+    return cleaned.strip()
+
+
+def _markdown_cell(value: Optional[str]) -> str:
+    if value is None:
+        return "-"
+    text = str(value)
+    if not text.strip():
+        return "-"
+    return _escape_markdown_cell(text)
+
+
+def snapshot_to_markdown(snapshot: SchedulerSnapshot) -> str:
+    """Return a Markdown table describing the jobs in *snapshot*."""
+
+    if snapshot.timestamp:
+        try:
+            timestamp = snapshot.timestamp.astimezone()
+        except ValueError:
+            timestamp = snapshot.timestamp
+    else:
+        timestamp = datetime.now()
+    lines = [
+        f"### PBS Jobs as of {timestamp.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"*Source*: {snapshot.source}",
+        "",
+    ]
+    headers = ["Job ID", "Name", "User", "Queue", "State", "Nodes", "Walltime", "Runtime"]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    reference_time = snapshot.timestamp or datetime.now()
+    if snapshot.jobs:
+        for job in _sort_jobs_for_display(snapshot.jobs):
+            runtime = _format_duration(job.runtime(reference_time))
+            row = [
+                job.id,
+                job.name,
+                job.user,
+                job.queue,
+                JOB_STATE_LABELS.get(job.state, job.state),
+                job.nodes or "-",
+                job.walltime or "-",
+                runtime,
+            ]
+            lines.append("| " + " | ".join(_markdown_cell(cell) for cell in row) + " |")
+    else:
+        empty_row = ["_No jobs available_"] + [""] * (len(headers) - 1)
+        lines.append("| " + " | ".join(empty_row) + " |")
+    if snapshot.errors:
+        lines.append("")
+        for error in snapshot.errors:
+            lines.append(f"> {error}")
+    return "\n".join(lines)
+
+
 def _env_flag(name: str) -> bool:
     """Return ``True`` when *name* is set to a truthy value."""
 
@@ -449,8 +511,37 @@ def _env_flag(name: str) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no"}
 
 
-def run() -> None:
+def run(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    fetcher: Optional[PBSDataFetcher] = None,
+) -> None:
     """Entry point used by the ``pbs-tui`` console script."""
+
+    parser = argparse.ArgumentParser(description="PBS Pro scheduler dashboard")
+    parser.add_argument(
+        "--inline",
+        action="store_true",
+        help="Fetch PBS data once and print a Markdown table instead of starting the TUI.",
+    )
+    parser.add_argument(
+        "--refresh-interval",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="How often the TUI refreshes PBS data (default: 30).",
+    )
+    args = parser.parse_args(argv)
+
+    fetcher_instance = fetcher or PBSDataFetcher()
+
+    if args.inline:
+        snapshot = asyncio.run(fetcher_instance.fetch_snapshot())
+        print(snapshot_to_markdown(snapshot))
+        if snapshot.errors:
+            for message in snapshot.errors:
+                print(message, file=sys.stderr)
+        return
 
     headless = _env_flag("PBS_TUI_HEADLESS")
     auto_pilot = None
@@ -464,7 +555,7 @@ def run() -> None:
 
         auto_pilot = _auto_quit
 
-    app = PBSTUI()
+    app = PBSTUI(fetcher=fetcher_instance, refresh_interval=args.refresh_interval)
     app.run(headless=headless, auto_pilot=auto_pilot)
 
 

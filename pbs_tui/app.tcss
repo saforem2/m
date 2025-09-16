@@ -1,25 +1,20 @@
 Screen {
-    layout: grid;
-    grid-rows: auto 1fr auto auto;
-    grid-columns: 1fr;
+    layout: vertical;
 }
 
 Header {
 }
 
-#body {
-    padding: 0 1;
-}
-
 #main {
     layout: horizontal;
-    height: 100%;
-    padding-right: 1;
+    height: 1fr;
+    padding: 0 1;
 }
 
 #left_panel {
     layout: vertical;
     width: 3fr;
+    height: 1fr;
     padding-right: 1;
 }
 
@@ -40,6 +35,7 @@ DataTable {
 
 #details {
     width: 2fr;
+    height: 1fr;
     border: tall $surface;
     padding: 1 2;
     margin-left: 1;

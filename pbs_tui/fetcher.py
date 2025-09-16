@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 from xml.etree import ElementTree as ET
 
 from .data import Job, Node, Queue, SchedulerSnapshot
@@ -16,6 +17,63 @@ from .samples import sample_snapshot
 _LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _stringify(value: object) -> str:
+    """Convert *value* into a human-readable string."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, set)):
+        parts = [segment for segment in (_stringify(item).strip() for item in value) if segment]
+        return ", ".join(parts)
+    return json.dumps(value, sort_keys=True)
+
+
+def _flatten_mapping(mapping: Dict[str, object], prefix: str = "") -> Dict[str, str]:
+    """Flatten nested dictionaries using dotted keys."""
+
+    flat: Dict[str, str] = {}
+    for raw_key, raw_value in mapping.items():
+        key = f"{prefix}{raw_key}" if prefix else str(raw_key)
+        if isinstance(raw_value, dict):
+            flat.update(_flatten_mapping(raw_value, f"{key}."))
+        else:
+            flat[key] = _stringify(raw_value)
+    return flat
+
+
+def _extract_records(
+    payload: object, options: Iterable[str]
+) -> List[Tuple[Optional[str], Dict[str, object]]]:
+    """Return ``(key, mapping)`` pairs matching any of *options* within *payload*."""
+
+    records: List[Tuple[Optional[str], Dict[str, object]]] = []
+    if isinstance(payload, dict):
+        for candidate in options:
+            if candidate in payload:
+                value = payload[candidate]
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if isinstance(item, dict):
+                            records.append((str(key), item))
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            records.append((None, item))
+                if records:
+                    return records
+        for value in payload.values():
+            nested = _extract_records(value, options)
+            if nested:
+                return nested
+    return records
 
 
 def _parse_bool(value: Optional[str]) -> Optional[bool]:
@@ -109,10 +167,13 @@ class PBSDataFetcher:
         self.include_queues = include_queues
         self.command_timeout = command_timeout
         self.fallback_to_sample = fallback_to_sample
+        self._qstat_jobs_json_cmd = [self.qstat_path, "-f", "-F", "json"]
         self._qstat_jobs_cmd = [self.qstat_path, "-f", "-x"]
         self._qstat_jobs_text_cmd = [self.qstat_path, "-f"]
+        self._qstat_queue_json_cmd = [self.qstat_path, "-Q", "-f", "-F", "json"]
         self._qstat_queue_cmd = [self.qstat_path, "-Q", "-f", "-x"]
         self._qstat_queue_text_cmd = [self.qstat_path, "-Q", "-f"]
+        self._pbsnodes_json_cmd = [self.pbsnodes_path, "-a", "-F", "json"]
         self._pbsnodes_cmd = [self.pbsnodes_path, "-x"]
         self._pbsnodes_text_cmd = [self.pbsnodes_path, "-a"]
 
@@ -162,6 +223,7 @@ class PBSDataFetcher:
 
     async def _fetch_jobs(self) -> Tuple[List[Job], List[str]]:
         attempts: Sequence[Tuple[List[str], Callable[[str], List[Job]], str]] = (
+            (self._qstat_jobs_json_cmd, self._parse_jobs_json, "qstat JSON output"),
             (self._qstat_jobs_cmd, self._parse_jobs_xml, "qstat XML output"),
             (self._qstat_jobs_text_cmd, self._parse_jobs_text, "qstat full output"),
         )
@@ -171,6 +233,7 @@ class PBSDataFetcher:
 
     async def _fetch_nodes(self) -> Tuple[List[Node], List[str]]:
         attempts: Sequence[Tuple[List[str], Callable[[str], List[Node]], str]] = (
+            (self._pbsnodes_json_cmd, self._parse_nodes_json, "pbsnodes JSON output"),
             (self._pbsnodes_cmd, self._parse_nodes_xml, "pbsnodes XML output"),
             (self._pbsnodes_text_cmd, self._parse_nodes_text, "pbsnodes full output"),
         )
@@ -180,6 +243,7 @@ class PBSDataFetcher:
 
     async def _fetch_queues(self) -> Tuple[List[Queue], List[str]]:
         attempts: Sequence[Tuple[List[str], Callable[[str], List[Queue]], str]] = (
+            (self._qstat_queue_json_cmd, self._parse_queues_json, "queue JSON output"),
             (self._qstat_queue_cmd, self._parse_queues_xml, "queue XML output"),
             (self._qstat_queue_text_cmd, self._parse_queues_text, "queue full output"),
         )
@@ -321,6 +385,53 @@ class PBSDataFetcher:
                 resources_max=_collect_child_text(queue_el.find("resources_max")),
                 comment=(queue_el.findtext("comment") or "").strip() or None,
             )
+            queues.append(queue)
+        return queues
+
+    def _parse_jobs_json(self, json_text: str) -> List[Job]:
+        payload = json.loads(json_text)
+        jobs: List[Job] = []
+        for key, record in _extract_records(payload, ("Jobs", "jobs", "Job", "job")):
+            mapping = _flatten_mapping(record)
+            if key and "Job_Id" not in mapping:
+                mapping["Job_Id"] = key
+            job = self._job_from_mapping(mapping)
+            if job is not None:
+                jobs.append(job)
+        return jobs
+
+    def _parse_nodes_json(self, json_text: str) -> List[Node]:
+        payload = json.loads(json_text)
+        nodes: List[Node] = []
+        for key, record in _extract_records(payload, ("nodes", "Nodes", "Node")):
+            mapping = _flatten_mapping(record)
+            name_value = (
+                mapping.get("name")
+                or mapping.get("Node_Name")
+                or mapping.get("Node")
+                or key
+                or ""
+            )
+            node = self._node_from_mapping(str(name_value), mapping)
+            if node is not None:
+                nodes.append(node)
+        return nodes
+
+    def _parse_queues_json(self, json_text: str) -> List[Queue]:
+        payload = json.loads(json_text)
+        queues: List[Queue] = []
+        for key, record in _extract_records(payload, ("Queue", "Queues", "queue")):
+            mapping = _flatten_mapping(record)
+            name = (
+                mapping.get("queue_name")
+                or mapping.get("name")
+                or mapping.get("Queue")
+                or key
+                or ""
+            )
+            if not name:
+                continue
+            queue = self._queue_from_mapping(str(name), mapping)
             queues.append(queue)
         return queues
 
@@ -533,6 +644,15 @@ class PBSDataFetcher:
         return queues
 
     def _queue_from_mapping(self, name: str, mapping: Dict[str, str]) -> Queue:
+        state_count_value: Optional[object] = mapping.get("state_count")
+        if state_count_value is None:
+            nested_counts: Dict[str, str] = {
+                key.split(".", 1)[1]: value
+                for key, value in mapping.items()
+                if key.startswith("state_count.") and "." in key
+            }
+            if nested_counts:
+                state_count_value = nested_counts
         resources_default = {
             key.split(".", 1)[1]: value.strip()
             for key, value in mapping.items()
@@ -550,7 +670,7 @@ class PBSDataFetcher:
             enabled=_parse_bool(mapping.get("enabled")),
             started=_parse_bool(mapping.get("started")),
             total_jobs=_parse_int(mapping.get("total_jobs")),
-            job_states=self._parse_state_counts(mapping.get("state_count")),
+            job_states=self._parse_state_counts(state_count_value),
             resources_default=resources_default,
             resources_max=resources_max,
             comment=comment,
@@ -614,12 +734,10 @@ class PBSDataFetcher:
         return jobs
 
     @staticmethod
-    def _parse_state_counts(state_count_text: Optional[str]) -> Dict[str, int]:
+    def _parse_state_counts(state_count: Optional[object]) -> Dict[str, int]:
         counts: Dict[str, int] = {}
-        if not state_count_text:
+        if not state_count:
             return counts
-        tokens = state_count_text.replace("\n", " ").replace(",", "").split()
-        i = 0
         mapping = {
             "transit": "T",
             "queued": "Q",
@@ -631,6 +749,16 @@ class PBSDataFetcher:
             "begun": "B",
             "finished": "F",
         }
+        if isinstance(state_count, dict):
+            for key, value in state_count.items():
+                code = mapping.get(str(key).lower(), str(key).upper()[:1])
+                try:
+                    counts[code] = int(str(value))
+                except (TypeError, ValueError):
+                    continue
+            return counts
+        tokens = str(state_count).replace("\n", " ").replace(",", "").split()
+        i = 0
         while i < len(tokens) - 1:
             key = tokens[i].rstrip(":").lower()
             value = tokens[i + 1]

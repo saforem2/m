@@ -8,8 +8,8 @@ track workload health in real time.
 
 ## Features
 
-- **Live PBS data** – executes `qstat -f -x`, `qstat -Q -f -x`, and `pbsnodes -x` to gather
-  jobs, queues, and node information.
+- **Live PBS data** – prefers the JSON (`-F json`) output of `qstat`/`pbsnodes` and falls back to
+  XML or text parsing so schedulers without newer flags continue to work.
 - **Automatic refresh** – updates every 30 seconds by default with a manual refresh binding
   (`r`).
 - **Summary cards** – quick totals for job states, node states, and queue health.
@@ -17,6 +17,8 @@ track workload health in real time.
   for the selected record.
 - **Fallback sample data** – optional bundled data makes it easy to demo the interface without
   connecting to a production scheduler (`PBS_TUI_SAMPLE_DATA=1`).
+- **Inline snapshot** – render a Markdown summary of the current queue with `pbs-tui --inline` for
+  easy sharing in chat or documentation.
 
 ## Installation
 
@@ -40,6 +42,9 @@ pbs-tui
 The same entry point is available via `python -m pbs_tui`. The interface displays a summary
 panel, tables for jobs/nodes/queues, and a detail pane for the selected row. Refreshing happens
 automatically; press `r` to force an immediate update.
+
+Adjust the refresh cadence with `pbs-tui --refresh-interval 60` (seconds) if you prefer a slower or
+faster polling loop.
 
 ### Key bindings
 
@@ -66,10 +71,24 @@ headless mode by exporting `PBS_TUI_HEADLESS=1`. Pairing this with `PBS_TUI_AUTO
 presses the `q` binding automatically after startup so `pbs-tui` exits cleanly once the interface
 has rendered its first update.
 
+### Markdown snapshot mode
+
+When running non-interactively you can emit a Markdown-formatted table summarising the active PBS
+jobs instead of starting the Textual interface:
+
+```bash
+PBS_TUI_SAMPLE_DATA=1 pbs-tui --inline
+```
+
+The command prints a table that can be pasted directly into Slack, GitHub, or other Markdown-aware
+tools. Any warnings raised while collecting data are written to standard error so they remain
+visible in logs.
+
 ## Architecture
 
-- `pbs_tui.fetcher.PBSDataFetcher` orchestrates `qstat`/`pbsnodes` calls, parses XML output, and
-  converts it into structured dataclasses (`Job`, `Node`, `Queue`).
+- `pbs_tui.fetcher.PBSDataFetcher` orchestrates `qstat`/`pbsnodes` calls, preferring JSON output and
+  falling back to XML/text before converting everything into structured dataclasses (`Job`, `Node`,
+  `Queue`).
 - `pbs_tui.app.PBSTUI` is the Textual application that renders the dashboard, periodically asks
   the fetcher for new data, and updates the widgets.
 - `pbs_tui.samples.sample_snapshot` provides the demonstration snapshot used when PBS commands

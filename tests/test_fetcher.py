@@ -1,4 +1,5 @@
 import asyncio
+import json
 import textwrap
 from datetime import datetime, timezone
 
@@ -21,6 +22,11 @@ def test_parse_state_counts_extracts_known_states():
 def test_parse_state_counts_ignores_noise():
     counts = PBSDataFetcher._parse_state_counts("queued: notanumber waiting: 4, unknown: 2")
     assert counts == {"W": 4, "U": 2}
+
+
+def test_parse_state_counts_accepts_dict():
+    counts = PBSDataFetcher._parse_state_counts({"Queued": "5", "Running": 3, "Held": 0})
+    assert counts == {"Q": 5, "R": 3, "H": 0}
 
 
 def test_parse_node_jobs_splits_entries():
@@ -84,6 +90,27 @@ def test_parse_jobs_text_extracts_fields():
     assert job.resources_used["walltime"] == "00:45:00"
 
 
+def test_parse_jobs_json_extracts_fields():
+    payload = {
+        "Jobs": {
+            "789.c": {
+                "Job_Name": "render",
+                "Job_Owner": "carol@cluster",
+                "queue": "vis",
+                "job_state": "Q",
+                "Resource_List": {"walltime": "00:20:00", "nodes": "1:ppn=16"},
+                "resources_used": {"walltime": "00:05:00"},
+            }
+        }
+    }
+    fetcher = PBSDataFetcher(force_sample=True)
+    job = fetcher._parse_jobs_json(json.dumps(payload))[0]
+    assert job.id == "789.c"
+    assert job.queue == "vis"
+    assert job.resources_requested["nodes"] == "1:ppn=16"
+    assert job.resources_used["walltime"] == "00:05:00"
+
+
 def test_parse_nodes_text_extracts_fields():
     text = textwrap.dedent(
         """
@@ -109,6 +136,25 @@ def test_parse_nodes_text_extracts_fields():
     assert nodes[1].state == "offline"
 
 
+def test_parse_nodes_json_extracts_fields():
+    payload = {
+        "nodes": {
+            "nid0003": {
+                "state": "job-exclusive",
+                "resources_available": {"ncpus": 64, "mem": "128gb"},
+                "resources_assigned": {"ncpus": 64},
+                "jobs": ["0/999.a", "0/888.b"],
+            }
+        }
+    }
+    fetcher = PBSDataFetcher(force_sample=True)
+    node = fetcher._parse_nodes_json(json.dumps(payload))[0]
+    assert node.name == "nid0003"
+    assert node.ncpus == 64
+    assert node.resources_available["mem"] == "128gb"
+    assert node.jobs == ["0/999.a", "0/888.b"]
+
+
 def test_parse_queues_text_extracts_fields():
     text = textwrap.dedent(
         """
@@ -130,3 +176,25 @@ def test_parse_queues_text_extracts_fields():
     assert queue.job_states == {"Q": 2, "R": 3}
     assert queue.resources_default["walltime"] == "02:00:00"
     assert queue.comment == "Production queue"
+
+
+def test_parse_queues_json_extracts_fields():
+    payload = {
+        "Queue": {
+            "analysis": {
+                "queue_name": "analysis",
+                "enabled": False,
+                "started": True,
+                "total_jobs": 4,
+                "state_count": {"Queued": 3, "Running": 1},
+                "resources_default": {"walltime": "04:00:00"},
+            }
+        }
+    }
+    fetcher = PBSDataFetcher(force_sample=True)
+    queue = fetcher._parse_queues_json(json.dumps(payload))[0]
+    assert queue.name == "analysis"
+    assert queue.enabled is False
+    assert queue.started is True
+    assert queue.job_states == {"Q": 3, "R": 1}
+    assert queue.resources_default["walltime"] == "04:00:00"
